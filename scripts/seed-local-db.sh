@@ -30,11 +30,10 @@ if [[ "${1:-}" == "--reset" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Apply migrations (idempotent — IF NOT EXISTS on all DDL)
+# Apply migrations (tracked via d1_migrations table — idempotent)
 # ---------------------------------------------------------------------------
 echo "Applying migrations..."
-$WRANGLER d1 execute "$DB" $LOCAL_FLAG --file migrations/0001_initial.sql 2>/dev/null || true
-$WRANGLER d1 execute "$DB" $LOCAL_FLAG --file migrations/0002_trusted_publishers.sql 2>/dev/null || true
+$WRANGLER d1 migrations apply "$DB" $LOCAL_FLAG
 
 # ---------------------------------------------------------------------------
 # Channels
