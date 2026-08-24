@@ -13,6 +13,7 @@ scripts/fixtures/
 scripts/mirror-cache/
 scripts/stats-*.json
 dist/
+.kilo/
 
 env/
 mirror_state.db*
