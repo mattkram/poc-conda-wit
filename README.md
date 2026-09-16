@@ -283,7 +283,7 @@ conda-forge would require the full reindex path.
 - **Failed-ingest files accumulate in `_incoming/`** — files that fail validation (e.g.
   corrupt packages) are not retried and not cleaned up automatically; add a periodic sweep
   if needed.
-- **`max_instances` on `[[containers]]`** (currently 10, `instance_type = "basic"`) is the
+- **`max_instances` on `[[containers]]`** (currently 10, `instance_type = "standard-1"`) is the
   real throughput ceiling for concurrent active channels, not the per-channel DO queue.
 - **No signature/hash verification** beyond what `conda_package_streaming` provides when
   extracting metadata.
