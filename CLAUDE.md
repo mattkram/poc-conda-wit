@@ -18,10 +18,13 @@ and the things most likely to trip up a fresh deploy.
     This is what gives atomicity/ordering — see README's "Atomicity,
     ordering, batching" section before changing this class.
 - `container/Dockerfile` + `container/entrypoint.py` — the actual indexer.
-  Python, `conda-index` + `conda_package_streaming` + `boto3`. Runs
-  `conda-index` for real, writes classic `repodata.json` AND CEP-16 sharded
-  repodata. Talks to R2 over its S3-compatible API, not the Workers R2
-  binding (it's a plain container process, not a Worker).
+  Python, `conda-index` + `conda_package_streaming` + `boto3`. Downloads a
+  package, extracts metadata, and appends/removes its entry from a
+  content-addressed CEP-16 shard. Writes classic `repodata.json` + shard index
+  by assembling from shards (see `POST /delete-package` for the delete side).
+  `conda-index` is only a manual-recovery tool (`POST /reindex`), never on the
+  hot path. Talks to R2 over its S3-compatible API, not the Workers R2 binding
+  (it's a plain container process, not a Worker).
 - `IndexerContainer` (in `worker.ts`) is the Durable Object wrapper Cloudflare
   Containers requires — it's what `ChannelQueue`'s alarm calls into.
 

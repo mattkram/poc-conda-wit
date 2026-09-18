@@ -5,11 +5,8 @@ Tier 1 metadata extractor for the shard-first ingestion pipeline.
     Body: {"channel": "main", "filename": "foo-1.0-0.conda", "staging_key": "main/_incoming/foo-1.0-0.conda"}
     Returns: {"filename": "...", "subdir": "...", "name": "...", "entry": {...repodata fields...}}
 
-  POST /reindex   (legacy full rebuild — used for deletions and reconciliation only)
-    Body: {"channel": "main", "subdir": "noarch"}
-
-  POST /delete-package  (legacy — delete + full reindex)
-    Body: {"channel": "main", "subdir": "noarch", "filename": "foo-1.0-0.conda"}
+  POST /delete-package  (shard prune — remove one build, no conda-index)
+    Body: {"channel": "main", "subdir": "noarch", "filename": "foo-1.0-0.conda", "name": "foo"}
 
 The hot path (/extract-metadata) is strictly per-package:
   1. Download the staged package from R2
@@ -403,8 +400,105 @@ def ingest_package(channel: str, filename: str, staging_key: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Legacy full-rebuild path — used for deletions and reconciliation only.
-# Not called in the normal per-package upload flow.
+# Package deletion — symmetric with ingest: remove the build from its shard.
+# No package downloads, no conda-index, no full-channel scan. Returns fast;
+# the Worker notifies SubdirIndexMerger to regenerate repodata.json.
+# ---------------------------------------------------------------------------
+
+def _resolve_name_from_repodata(channel: str, subdir: str, filename: str) -> str | None:
+    """Best-effort: map a filename to its package name via the subdir's repodata.json."""
+    try:
+        obj = s3.get_object(Bucket=BUCKET, Key=f"{channel}/{subdir}/repodata.json")
+        rd = json.loads(obj["Body"].read())
+    except (botocore.exceptions.ClientError, json.JSONDecodeError):
+        return None
+    allpkgs = {**rd.get("packages", {}), **rd.get("packages.conda", {})}
+    meta = allpkgs.get(filename) or {}
+    return (meta or {}).get("name")
+
+
+def delete_package(channel: str, subdir: str, filename: str, name: str | None = None) -> dict:
+    """
+    Remove one build from a channel. The package object is already deleted by
+    the Worker; here we prune the build from its content-addressed shard,
+    deleting the shard + pointer (and signalling the caller with `empty: True`)
+    when the last build of that name goes away.
+    """
+    t0 = time.time()
+    log("delete_package.start", channel=channel, subdir=subdir, filename=filename)
+
+    if not name:
+        name = _resolve_name_from_repodata(channel, subdir, filename)
+        log("delete_package.resolve_name", channel=channel, subdir=subdir,
+            filename=filename, name=name or "")
+    if not name:
+        return {"removed": False, "reason": "unknown package name — pass name in body",
+                "channel": channel, "subdir": subdir, "filename": filename}
+
+    prefix = f"{channel}/{subdir}"
+    ptr_key = f"{prefix}/_shardptr/{name}"
+
+    old_hash = None
+    try:
+        ptr = s3.get_object(Bucket=BUCKET, Key=ptr_key)
+        old_hash = ptr["Body"].read().decode().strip()
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] not in ("404", "NoSuchKey"):
+            raise
+
+    if not old_hash:
+        log("delete_package.no_shardptr", channel=channel, subdir=subdir,
+            name=name, filename=filename)
+        return {"removed": True, "empty": False, "no_shard": True,
+                "name": name, "subdir": subdir}
+
+    shard_key = f"{prefix}/{old_hash}.msgpack.zst"
+    shard = _empty_shard()
+    try:
+        existing = s3.get_object(Bucket=BUCKET, Key=shard_key)
+        shard = _unpack_shard(existing["Body"].read())
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] not in ("404", "NoSuchKey"):
+            raise
+
+    pkgs = shard.get("packages", {})
+    pkgs_conda = shard.get("packages.conda", {})
+    if filename in pkgs:
+        del pkgs[filename]
+    elif filename in pkgs_conda:
+        del pkgs_conda[filename]
+    else:
+        log("delete_package.not_in_shard", channel=channel, subdir=subdir,
+            name=name, filename=filename)
+        return {"removed": True, "empty": False, "not_in_shard": True,
+                "name": name, "subdir": subdir}
+
+    if not pkgs and not pkgs_conda:
+        s3.delete_object(Bucket=BUCKET, Key=shard_key)
+        s3.delete_object(Bucket=BUCKET, Key=ptr_key)
+        log("delete_package.done", channel=channel, subdir=subdir, name=name,
+            filename=filename, empty=True, elapsed_s=round(time.time() - t0, 3))
+        return {"removed": True, "empty": True, "name": name, "subdir": subdir,
+                "old_hash": old_hash}
+
+    compressed, new_hash = _pack_shard(shard)
+    s3.put_object(
+        Bucket=BUCKET, Key=f"{prefix}/{new_hash}.msgpack.zst",
+        Body=compressed,
+        CacheControl="public, max-age=31536000, immutable",
+    )
+    s3.put_object(Bucket=BUCKET, Key=ptr_key, Body=new_hash.encode())
+    s3.delete_object(Bucket=BUCKET, Key=shard_key)
+    log("delete_package.done", channel=channel, subdir=subdir, name=name,
+        filename=filename, old_hash=old_hash, new_hash=new_hash,
+        elapsed_s=round(time.time() - t0, 3))
+    return {"removed": True, "empty": False, "name": name, "subdir": subdir,
+            "old_hash": old_hash, "new_hash": new_hash}
+
+
+# ---------------------------------------------------------------------------
+# Legacy full-rebuild path — previously the deletion path via conda-index.
+# Kept for manual recovery; normal deletes use shard pruning above.
 # ---------------------------------------------------------------------------
 
 PACKAGE_EXTENSIONS = (".conda", ".tar.bz2")
@@ -775,10 +869,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(400, b"missing channel, subdir, or filename")
                 return
             try:
-                s3.delete_object(Bucket=BUCKET, Key=f"{channel}/{subdir}/{filename}")
-                reindex(channel, subdir)
-                self._respond(200, json.dumps({"ok": True}).encode())
+                result = delete_package(channel, subdir, filename, payload.get("name"))
+                self._respond(200, json.dumps(result).encode())
             except Exception as e:  # noqa: BLE001
+                log("delete_package.error", channel=channel, subdir=subdir,
+                    filename=filename, error=str(e))
                 self._respond(500, json.dumps({"error": str(e)}).encode())
 
         else:
