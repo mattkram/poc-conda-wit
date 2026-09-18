@@ -1,5 +1,5 @@
 import { getContainer } from "@cloudflare/containers";
-import type { Env, TrustedPublisherRow } from "../types.js";
+import type { Env, TrustedPublisherRow, BrowseRecord } from "../types.js";
 import { esc, channelNamespace, fmtBytes, fmtDate, userWidget } from "../utils.js";
 import { resolveLogin } from "../handlers/auth.js";
 import {
@@ -564,7 +564,7 @@ export async function handleBrowsePackage(
       <td class="num">${b.size != null ? fmtBytes(b.size) : ""}</td>
       <td class="num mono" title="${b.sha256 ? `SHA256: ${b.sha256}` : ""}">${b.md5 ? b.md5.slice(0, 8) + "…" : ""}</td>
       <td class="num">${fmtDate(b.timestamp)}</td>
-      ${isOwner ? `<td><button class="del-file-btn" data-channel="${esc(channel)}" data-subdir="${esc(b.subdir)}" data-filename="${esc(b.filename)}">Delete</button></td>` : ""}
+      ${isOwner ? `<td><button class="del-file-btn" data-channel="${esc(channel)}" data-subdir="${esc(b.subdir)}" data-filename="${esc(b.filename)}" data-name="${esc(name)}">Delete</button></td>` : ""}
     </tr>`;
 
   const versionGroups = [...byVersion.entries()]
@@ -654,7 +654,7 @@ document.addEventListener('click', async (e) => {
   const { channel, subdir, filename } = btn.dataset;
   if (!confirm('Delete ' + filename + ' from ' + subdir + '?\\nThis will reindex the channel.')) return;
   btn.disabled = true; btn.textContent = 'Deleting…';
-  const resp = await fetch('/channel/' + channel + '/' + subdir + '/' + filename, {
+  const resp = await fetch('/channel/' + channel + '/' + subdir + '/' + filename + '?name=' + encodeURIComponent(btn.dataset.name || ''), {
     method: 'DELETE', credentials: 'same-origin'
   });
   if (resp.ok) {
@@ -776,17 +776,74 @@ export async function handleDeletePackage(
 
   await env.CHANNEL_BUCKET.delete(key);
 
+  const name = new URL(request.url).searchParams.get("name") ?? "";
+
   const container = getContainer(env.INDEXER, channel);
-  const resp = await container.fetch("http://container/reindex", {
+  let resp: Response;
+  let result: { empty?: boolean; name?: string } = {};
+  try {
+    resp = await container.fetch("http://container/delete-package", {
+      method: "POST",
+      body: JSON.stringify({ channel, subdir, filename, name: name || undefined }),
+      headers: { "content-type": "application/json" },
+    });
+    result = (await resp.json().catch(() => ({}))) as { empty?: boolean; name?: string };
+  } catch (err) {
+    return new Response(
+      `deleted ${filename} from R2 but the indexer did not confirm the shard prune (${String(err)}). The subdir repodata will not be refreshed.`,
+      { status: 500 },
+    );
+  }
+  if (!resp.ok) {
+    return new Response(
+      `deleted ${filename} but shard prune failed: ${JSON.stringify(result)}`,
+      { status: 500 },
+    );
+  }
+
+  const pkgName = result.name ?? name;
+  if (result.empty && pkgName) {
+    await reconcileBrowseRecord(channel, subdir, pkgName, env);
+  }
+
+  const mergerId = env.MERGER.idFromName(`${channel}/${subdir}`);
+  const merger = env.MERGER.get(mergerId);
+  await merger.fetch("http://merger/notify", {
     method: "POST",
     body: JSON.stringify({ channel, subdir }),
     headers: { "content-type": "application/json" },
   });
-  if (!resp.ok) {
-    return new Response(`deleted ${filename} but reindex failed: ${await resp.text()}`, {
-      status: 500,
-    });
-  }
 
-  return new Response(`deleted ${filename} and reindexed ${channel}/${subdir}`, { status: 200 });
+  return new Response(`deleted ${filename} from ${channel}/${subdir}; reindex queued`, {
+    status: 200,
+  });
+}
+
+async function reconcileBrowseRecord(
+  channel: string,
+  subdir: string,
+  name: string,
+  env: Env,
+): Promise<void> {
+  const browseKey = `${channel}/_browse/${name}.json`;
+  const obj = await env.CHANNEL_BUCKET.get(browseKey);
+  if (!obj) return;
+  const rec = await obj.json<BrowseRecord>();
+  const subdirs = (rec.subdirs ?? []).filter((s) => s !== subdir);
+  if (subdirs.length === 0) {
+    await env.CHANNEL_BUCKET.delete(browseKey);
+    await env.DB.prepare(`DELETE FROM packages WHERE channel = ? AND name = ?`)
+      .bind(channel, name)
+      .run();
+    return;
+  }
+  rec.subdirs = subdirs;
+  await env.CHANNEL_BUCKET.put(browseKey, JSON.stringify(rec), {
+    httpMetadata: { contentType: "application/json" },
+  });
+  await env.DB.prepare(
+    `UPDATE packages SET subdirs = ?, updated_at = ? WHERE channel = ? AND name = ?`,
+  )
+    .bind(JSON.stringify(subdirs), Date.now(), channel, name)
+    .run();
 }

@@ -318,6 +318,8 @@ class ChannelClient:
         if status != 200:
             raise ChannelError(f"set-visibility failed ({status}): {data}")
         return data
+
+    def get_repodata(self, channel: str, subdir: str) -> dict:
         """Fetch and return repodata.json for a channel/subdir."""
         url = f"{self.worker_url}/repo/{channel}/{subdir}/repodata.json"
         status, data = _get_json(url)

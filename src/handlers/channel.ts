@@ -199,15 +199,24 @@ export async function handleDeleteChannel(
   channel: string,
   env: Env,
 ): Promise<Response> {
-  const auth = request.headers.get("authorization") ?? "";
-  const token = auth.replace(/^Bearer\s+/i, "");
-  const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
-  if (!claims) return new Response("unauthorized", { status: 401 });
-
   if (!CHANNEL_NAME_RE.test(channel)) return new Response("invalid channel name", { status: 400 });
 
-  const denied = await checkChannelAccess(channel, claims.login, env);
+  const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
+  if (!login) return new Response("unauthorized", { status: 401 });
+
+  const denied = await checkChannelAccess(channel, login, env);
   if (denied) return denied;
+
+  // Purge per-channel queue state so no pending ingest/claim retries a channel
+  // that is about to vanish. Best-effort — these don't affect R2 cleanup.
+  await Promise.allSettled([
+    env.QUEUE.get(env.QUEUE.idFromName(channel))
+      .fetch("http://queue/purge", { method: "POST" })
+      .catch(() => {}),
+    env.INGEST_QUEUE.get(env.INGEST_QUEUE.idFromName(channel))
+      .fetch("http://queue/purge", { method: "POST" })
+      .catch(() => {}),
+  ]);
 
   let deleted = 0;
   let cursor: string | undefined;
@@ -217,6 +226,16 @@ export async function handleDeleteChannel(
     deleted += list.objects.length;
     cursor = list.truncated ? list.cursor : undefined;
   } while (cursor);
+
+  // Remove metadata. packages and trusted_publishers cascade via FK; FTS stays
+  // in sync via triggers. Re-uploading to the same channel re-creates the row.
+  await env.DB.prepare(`DELETE FROM channels WHERE name = ?`).bind(channel).run();
+
+  // Free the per-channel container instance if it is running.
+  try {
+    const { getContainer } = await import("@cloudflare/containers");
+    getContainer(env.INDEXER, channel).destroy().catch(() => {});
+  } catch {}
 
   return Response.json({ deleted, channel });
 }

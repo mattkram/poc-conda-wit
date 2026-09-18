@@ -10,8 +10,9 @@ orchestration, and a browse UI; one Cloudflare Container running the indexer tha
 upload and sleeps 2 min after going idle.
 Accepts both `.conda` (current format) and legacy `.tar.bz2` packages.
 `conda_package_streaming` extracts metadata from either uniformly.
-`conda-index` is present in the container image but is **only invoked on the deletion slow
-path** — normal uploads never call it (see [Note on conda-index](#note-on-conda-index)).
+`conda-index` is present in the container image but is **never called by the hot
+path** — uploads and deletes both mutate the content-addressed shards directly
+(see [Note on conda-index](#note-on-conda-index)).
 
 ## Architecture
 
@@ -219,8 +220,46 @@ All endpoints accept and return JSON.
 | `POST /ingest-package` | `ChannelIngestQueue` alarm | **Hot path.** Download staged package → extract metadata via `conda_package_streaming` → read-modify-write CEP-16 shard in R2 → move to final location → delete staging → call back to Worker D1. Returns `{filename, name, subdir, new_hash, old_hash}`. |
 | `POST /rebuild-index` | `SubdirIndexMerger` alarm | Reads all `_shardptr/<name>` pointers → assembles `repodata_shards.msgpack.zst` (CEP-16) + `repodata.json` from existing shards. **No package downloads, no conda-index.** Returns `202` immediately; runs in a background thread to avoid Worker fetch timeouts on large subdirs. |
 | `POST /rebuild-browse` | Admin / reconcile | Scans all `repodata.json` files across subdirs → writes per-name `_browse/<name>.json` → rebuilds the browse index. Used for backfill/reconciliation. |
+| `POST /delete-package` | Worker delete handler | Prune one build from its package shard (`{channel}/{subdir}/_shardptr/<name>`), deleting the shard + pointer when the last build goes away; returns `{removed, empty, name}` so the Worker can reconcile the browse record and D1. **No downloads, no `conda-index`** — runs in milliseconds once the container is warm. |
 | `POST /extract-metadata` | Internal | Download package → extract metadata → return repodata entry dict. Does **not** write anything. |
-| `POST /reindex` | Deletion slow path | Download all packages + cache.db → run `conda-index` subprocess → upload results. Called after `DELETE /channel/:channel/:subdir/:filename`. |
+| `POST /reindex` | Manual recovery only | Legacy: download all packages + cache.db → run `conda-index` subprocess → upload results. Kept for backwards compatibility; normal deletes no longer use it. |
+
+## Delete flow (single package)
+
+`DELETE /channel/{channel}/{subdir}/{filename}?name={package_name}` — owner only
+(Bearer upload token or session cookie):
+
+1. The Worker deletes the package object from R2 (`{channel}/{subdir}/{filename}`).
+2. `{channel}`'s container is woken and prunes the build from its content-addressed
+   shard — the same structure uploads maintain, so deleting one build never requires
+   re-scanning the subdir.
+3. If that was the last build of the name in the subdir, the Worker drops the subdir
+   from the channel-level `_browse/<name>.json` record (deleting the record + the D1
+   `packages` row if no builds remain anywhere).
+4. `SubdirIndexMerger` is notified and regenerates `repodata.json` + `repodata_shards`
+   from the remaining shards on its debounced alarm.
+
+The browser Delete button on the package detail page drives this endpoint. The
+`scripts/channel_manager.py delete` command drives the same API.
+
+## Bulk channel delete (cleanup)
+
+`DELETE /channel/{channel}` — owner only (Bearer token or cookie). Wipes everything
+for one channel: every R2 object under `{channel}/` (packages, shards, repodata,
+`_browse`, `_incoming`), the D1 `channels`/`packages`/`trusted_publishers` rows, and
+the per-channel `ChannelQueue`/`ChannelIngestQueue` state. The container instance is
+stopped if running.
+
+```bash
+python scripts/channel_manager.py purge --channel <channel> --yes
+# or
+curl -X DELETE https://conda.matt-kramer.com/channel/<channel> \
+  -H "Authorization: Bearer <upload_token>"
+```
+
+Superadmins can also delete any R2 prefix (e.g. `old/debug/`) with
+`POST /internal/delete-r2-prefix` (`{"prefix": "..."}`) — note this only touches R2;
+use the channel endpoint when you want the D1 metadata and queues cleaned up too.
 
 ## Atomicity, ordering, batching
 
@@ -259,12 +298,12 @@ conda install -c https://conda.matt-kramer.com/repo/main some-pkg
 
 ## Note on conda-index
 
-`conda-index` is present in the container image but is only invoked on the **slow path**:
-deleting a package triggers a full `conda-index` reindex of the affected subdir (since
-removing a file requires re-scanning what remains). Normal uploads never call `conda-index`
-— instead, `conda_package_streaming` extracts metadata per-package incrementally and the
-container assembles the same `repodata.json` fields and CEP-16 shard format that
-`conda-index` would produce.
+`conda-index` is present in the container image but is **never called on the normal
+paths**. Uploads extract metadata per-package with `conda_package_streaming` and append
+to a content-addressed shard; deleting a package prunes the same shard. Both paths then
+have `SubdirIndexMerger` reassemble `repodata.json` and the CEP-16 shard index from the
+remaining shards — no package bytes are re-read. The old `conda-index` reindex is kept
+only as a manual recovery tool (`POST /reindex`).
 
 Consequence: `patch_instructions.json` and `current_repodata.json` are **not** generated on
 the hot path. For private/org channels built from your own packages this is fine; mirroring
@@ -279,7 +318,8 @@ conda-forge would require the full reindex path.
   all clients. If a channel has at least one trusted-publisher rule with `require_trusted=1`,
   normal tokens are rejected for that channel.
 - **No bulk deletion or yanking UI** — owners can delete individual files from the package
-  detail page; bulk and yank-without-delete are not yet implemented.
+  detail page, and `DELETE /channel/{channel}` (or `channel_manager.py purge`) wipes a whole
+  channel. There is no UI for either yet, and no "yank" (hide without delete).
 - **Failed-ingest files accumulate in `_incoming/`** — files that fail validation (e.g.
   corrupt packages) are not retried and not cleaned up automatically; add a periodic sweep
   if needed.

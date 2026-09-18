@@ -184,7 +184,7 @@ def cmd_delete(args, client: ChannelClient) -> None:
     print(f"Deleting {args.filename} from {args.channel}/{args.subdir}...")
     try:
         client.delete_package(args.channel, args.subdir, args.filename, token)
-        print("Deleted and reindexed.")
+        print("Deleted; subdir reindex queued.")
     except ChannelError as e:
         sys.exit(f"ERROR: {e}")
 
