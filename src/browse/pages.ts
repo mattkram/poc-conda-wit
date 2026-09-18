@@ -641,13 +641,28 @@ ${GOOGLE_FONTS}
     </div>
   </section>
   ${depsSection}
-  <section class="detail-section">
+  <section class="detail-section" id="files-section">
     <h2>Files <span class="ver-count">${builds.length} total across ${byVersion.size} version${byVersion.size === 1 ? "" : "s"}</span></h2>
     ${versionGroups || `<div class="empty">No files.</div>`}
   </section>
 </div>
 </main>
 ${isOwner ? `<script>
+function updateFilesCounts(section) {
+  var groups = section.querySelectorAll(':scope > details');
+  var files = section.querySelectorAll('.files-table tbody tr').length;
+  var head = section.querySelector('h2 .ver-count');
+  if (head) head.textContent = files + ' total across ' + groups.length + ' version' + (groups.length === 1 ? '' : 's');
+  if (groups.length === 0) {
+    var empty = section.querySelector('.empty');
+    if (!empty) {
+      var div = document.createElement('div');
+      div.className = 'empty';
+      div.textContent = 'No files.';
+      section.appendChild(div);
+    }
+  }
+}
 document.addEventListener('click', async (e) => {
   const btn = e.target.closest('.del-file-btn');
   if (!btn) return;
@@ -657,14 +672,22 @@ document.addEventListener('click', async (e) => {
   const resp = await fetch('/channel/' + channel + '/' + subdir + '/' + filename + '?name=' + encodeURIComponent(btn.dataset.name || ''), {
     method: 'DELETE', credentials: 'same-origin'
   });
-  if (resp.ok) {
-    const row = btn.closest('tr');
-    row.style.opacity = '0.4';
-    setTimeout(() => { row.remove(); }, 400);
-  } else {
+  if (!resp.ok) {
     alert('Delete failed: ' + await resp.text());
     btn.disabled = false; btn.textContent = 'Delete';
+    return;
   }
+  const row = btn.closest('tr');
+  row.style.opacity = '0.4';
+  setTimeout(() => {
+    row.remove();
+    const details = row.closest('details');
+    if (details) {
+      const tbody = details.querySelector('tbody');
+      if (tbody && tbody.querySelectorAll('tr').length === 0) details.remove();
+    }
+    updateFilesCounts(document.getElementById('files-section'));
+  }, 400);
 });
 </script>` : ""}
 ${FOOTER_HTML}
