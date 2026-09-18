@@ -200,15 +200,17 @@ scoped 15-minute upload token. Manage trusted publishers via the channel admin p
 
 ## Durable Object roles
 
-Five DOs collaborate to make the ingest pipeline serialised, batched, and crash-safe:
+Six DOs collaborate to make ingest/deletes serialised, batched, and crash-safe, and to
+keep the conda-index cold path off the hot path:
 
 | DO | Binding | Instance key | Role |
 |---|---|---|---|
-| `IndexerContainer` | `INDEXER` | `{channel}`, `{channel}/{subdir}/_merge`, `{channel}/_rebuild-browse` | Cloudflare Containers wrapper — the actual Python process |
+| `IndexerContainer` | `INDEXER` | `{channel}`, `{channel}/{subdir}/_merge`, `{channel}/{subdir}/_cold-index`, `{channel}/_rebuild-browse` | Cloudflare Containers wrapper — the actual Python process |
 | `ChannelQueue` | `QUEUE` | one per channel | Debounces uploads (~5s window), owns `owner`/`visibility` state, handles channel claim |
 | `PackageIngestor` | `INGESTOR` | `{channel}/{filename}` | Thin fan-out relay — lets `ChannelQueue` await multiple dispatches in parallel without coupling to `ChannelIngestQueue` |
 | `ChannelIngestQueue` | `INGEST_QUEUE` | one per channel | Serialises container `/ingest-package` calls (one at a time), retries with back-off on failure |
 | `SubdirIndexMerger` | `MERGER` | `{channel}/{subdir}` | Debounces `rebuild-index` calls (~3s), coalesces concurrent package ingests into a single rebuild |
+| `ChannelReindexer` | `COLD_INDEX` | `{channel}/{subdir}` | Debounced **cold path** — after a package delete, wakes the container's `conda-index` reindex in the background so the shard operations are eventually reconciled against real package files |
 
 ## Container endpoints
 

@@ -31,6 +31,7 @@ export { ChannelQueue } from "./do/channel-queue.js";
 export { PackageIngestor } from "./do/package-ingestor.js";
 export { ChannelIngestQueue } from "./do/channel-ingest-queue.js";
 export { SubdirIndexMerger } from "./do/subdir-index-merger.js";
+export { ChannelReindexer } from "./do/channel-reindexer.js";
 
 // ---------------------------------------------------------------------------
 // Handler imports

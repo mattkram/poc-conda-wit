@@ -31,7 +31,8 @@ bindings = [
   { name = "QUEUE",        class_name = "ChannelQueue" },
   { name = "INGESTOR",     class_name = "PackageIngestor" },
   { name = "MERGER",       class_name = "SubdirIndexMerger" },
-  { name = "INGEST_QUEUE", class_name = "ChannelIngestQueue" }
+  { name = "INGEST_QUEUE", class_name = "ChannelIngestQueue" },
+  { name = "COLD_INDEX",   class_name = "ChannelReindexer" }
 ]
 
 [[migrations]]
@@ -49,6 +50,10 @@ new_sqlite_classes = ["PackageIngestor", "SubdirIndexMerger"]
 [[migrations]]
 tag = "v4"
 new_sqlite_classes = ["ChannelIngestQueue"]
+
+[[migrations]]
+tag = "v5"
+new_sqlite_classes = ["ChannelReindexer"]
 
 [[d1_databases]]
 binding = "DB"
