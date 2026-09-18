@@ -14,6 +14,7 @@ export interface Env {
   INGESTOR: DurableObjectNamespace;
   MERGER: DurableObjectNamespace;
   INGEST_QUEUE: DurableObjectNamespace;
+  COLD_INDEX: DurableObjectNamespace;
   GITHUB_CLIENT_ID: string;
   GITHUB_CLIENT_SECRET: string;
   UPLOAD_TOKEN_SECRET: string;

@@ -855,11 +855,18 @@ class Handler(BaseHTTPRequestHandler):
             if not channel or not subdir:
                 self._respond(400, b"missing channel or subdir")
                 return
-            try:
-                reindex(channel, subdir)
-                self._respond(200, json.dumps({"ok": True}).encode())
-            except Exception as e:  # noqa: BLE001
-                self._respond(500, json.dumps({"error": str(e)}).encode())
+            # Run in a background thread so we can return 202 immediately.
+            # conda-index on a real subdir far exceeds the Worker's ~30s
+            # container-fetch timeout; the DO debounces so this only fires
+            # (at most) once per debounce window.
+            import threading
+            def _run():
+                try:
+                    reindex(channel, subdir)
+                except Exception as e:  # noqa: BLE001
+                    log("reindex.error", channel=channel, subdir=subdir, error=str(e))
+            threading.Thread(target=_run, daemon=True).start()
+            self._respond(202, json.dumps({"status": "reindexing"}).encode())
 
         elif self.path == "/delete-package":
             channel = payload.get("channel")

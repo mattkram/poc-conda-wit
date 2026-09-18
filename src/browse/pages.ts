@@ -771,34 +771,40 @@ export async function handleDeletePackage(
   if (denied) return denied;
 
   const key = `${channel}/${subdir}/${filename}`;
-  const exists = await env.CHANNEL_BUCKET.head(key);
-  if (!exists) return new Response(`${key} not found`, { status: 404 });
-
   await env.CHANNEL_BUCKET.delete(key);
+
+  // Schedule the cold conda-index reindex up front. It reconciles repodata
+  // from the actual package files in the background (debounced via
+  // ChannelReindexer), so even if the hot shard prune below fails, the
+  // subdir is repaired eventually rather than left listing a dead object.
+  await scheduleColdReindex(channel, subdir, env);
 
   const name = new URL(request.url).searchParams.get("name") ?? "";
 
   const container = getContainer(env.INDEXER, channel);
   let resp: Response;
-  let result: { empty?: boolean; name?: string } = {};
+  let result: { removed?: boolean; empty?: boolean; name?: string } = {};
   try {
     resp = await container.fetch("http://container/delete-package", {
       method: "POST",
       body: JSON.stringify({ channel, subdir, filename, name: name || undefined }),
       headers: { "content-type": "application/json" },
     });
-    result = (await resp.json().catch(() => ({}))) as { empty?: boolean; name?: string };
+    result = (await resp.json().catch(() => ({}))) as { removed?: boolean; empty?: boolean; name?: string };
   } catch (err) {
     return new Response(
-      `deleted ${filename} from R2 but the indexer did not confirm the shard prune (${String(err)}). The subdir repodata will not be refreshed.`,
+      `deleted ${filename} from R2 but the indexer did not confirm the shard prune (${String(err)}). A cold conda-index reindex was scheduled to reconcile repodata.`,
       { status: 500 },
     );
   }
   if (!resp.ok) {
     return new Response(
-      `deleted ${filename} but shard prune failed: ${JSON.stringify(result)}`,
+      `deleted ${filename} but shard prune failed: ${JSON.stringify(result)}. A cold conda-index reindex was scheduled to reconcile repodata.`,
       { status: 500 },
     );
+  }
+  if (result.removed === false) {
+    return new Response(`${key} not found`, { status: 404 });
   }
 
   const pkgName = result.name ?? name;
@@ -816,6 +822,19 @@ export async function handleDeletePackage(
 
   return new Response(`deleted ${filename} from ${channel}/${subdir}; reindex queued`, {
     status: 200,
+  });
+}
+
+async function scheduleColdReindex(
+  channel: string,
+  subdir: string,
+  env: Env,
+): Promise<void> {
+  const id = env.COLD_INDEX.idFromName(`${channel}/${subdir}`);
+  await env.COLD_INDEX.get(id).fetch("http://reindexer/notify", {
+    method: "POST",
+    body: JSON.stringify({ channel, subdir }),
+    headers: { "content-type": "application/json" },
   });
 }
 
