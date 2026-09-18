@@ -6,6 +6,13 @@ Worker for auth + upload, one Cloudflare Container running real
 for the full request-flow write-up; this file is the bootstrap checklist
 and the things most likely to trip up a fresh deploy.
 
+## Git conventions
+
+- Commits and PR titles must use Conventional Commits syntax:
+  `fix:`, `feat:`, `docs:`, `refactor:`, `test:`, `chore:`, `perf:`, etc.
+  Lowercase type, optionally scoped (`fix(delete): ...`). Write the
+  subject in the imperative mood.
+
 ## Architecture at a glance
 
 - `src/worker.ts` — the Worker. Three things live here:
